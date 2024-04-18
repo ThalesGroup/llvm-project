@@ -2886,3 +2886,7 @@ WebAssemblyTargetLowering::PerformDAGCombine(SDNode *N,
     return performTruncateCombine(N, DCI);
   }
 }
+
+bool WebAssemblyTargetLowering::useLoadStackGuardNode() const {
+  return true;
+}

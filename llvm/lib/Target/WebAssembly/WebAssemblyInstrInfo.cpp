@@ -37,8 +37,7 @@ WebAssemblyInstrInfo::WebAssemblyInstrInfo(const WebAssemblySubtarget &STI)
     : WebAssemblyGenInstrInfo(WebAssembly::ADJCALLSTACKDOWN,
                               WebAssembly::ADJCALLSTACKUP,
                               WebAssembly::CATCHRET),
-      RI(STI.getTargetTriple()) {}
-
+    Subtarget(STI), RI(STI.getTargetTriple()) {}
 bool WebAssemblyInstrInfo::isReallyTriviallyReMaterializable(
     const MachineInstr &MI) const {
   switch (MI.getOpcode()) {
@@ -227,6 +226,25 @@ bool WebAssemblyInstrInfo::isExplicitTargetIndexDef(const MachineInstr &MI,
   if (WebAssembly::isLocalSet(Opc) || WebAssembly::isLocalTee(Opc)) {
     Index = WebAssembly::TI_LOCAL;
     Offset = MI.explicit_uses().begin()->getImm();
+    return true;
+  }
+  return false;
+}
+
+bool WebAssemblyInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
+  if(MI.getOpcode() == TargetOpcode::LOAD_STACK_GUARD) {
+    MachineFunction *MF = MI.getParent()->getParent();
+    const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
+    const char *BaseName = MF->createExternalSymbolName("__stack_chk_guard");
+
+    MachineInstrBuilder MIB = BuildMI(*MF, MI.getDebugLoc(),
+                                  TII->get(Subtarget.hasAddr64()
+                                       ? WebAssembly::GLOBAL_GET_I64
+                                       : WebAssembly::GLOBAL_GET_I32))
+                                  .addDef(MI.getOperand(0).getReg())
+                                  .addExternalSymbol(BaseName);
+    MI.getParent()->insert(MI.getIterator(), MIB.getInstr());
+    MI.eraseFromParent();
     return true;
   }
   return false;
