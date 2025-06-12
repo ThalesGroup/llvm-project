@@ -8,7 +8,7 @@
 
 // UNSUPPORTED: c++03, c++11, c++14, c++17
 
-// XFAIL: libcpp-has-no-incomplete-tzdb
+// XFAIL: libcpp-has-no-experimental-tzdb
 
 // <chrono>
 
@@ -28,7 +28,7 @@
 #include <string>
 #include <type_traits>
 
-int main(int, const char**) {
+int main(int, char**) {
   static_assert(std::is_aggregate_v<std::chrono::sys_info>);
 
   std::chrono::sys_info sys_info{

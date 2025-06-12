@@ -14,6 +14,7 @@
 #include "Feature.h"
 #include "GlobalCompilationDatabase.h"
 #include "LSPBinder.h"
+#include "ModulesBuilder.h"
 #include "Protocol.h"
 #include "SemanticHighlighting.h"
 #include "SourceCode.h"
@@ -51,6 +52,7 @@
 
 namespace clang {
 namespace clangd {
+
 namespace {
 // Tracks end-to-end latency of high level lsp calls. Measurements are in
 // seconds.
@@ -563,6 +565,12 @@ void ClangdLSPServer::onInitialize(const InitializeParams &Params,
     Mangler.ResourceDir = *Opts.ResourceDir;
   CDB.emplace(BaseCDB.get(), Params.initializationOptions.fallbackFlags,
               std::move(Mangler));
+
+  if (Opts.EnableExperimentalModulesSupport) {
+    ModulesManager.emplace(*CDB);
+    Opts.ModulesManager = &*ModulesManager;
+  }
+
   {
     // Switch caller's context with LSPServer's background context. Since we
     // rather want to propagate information from LSPServer's context into the
@@ -583,7 +591,10 @@ void ClangdLSPServer::onInitialize(const InitializeParams &Params,
            {"save", true},
        }},
       {"documentFormattingProvider", true},
-      {"documentRangeFormattingProvider", true},
+      {"documentRangeFormattingProvider",
+       llvm::json::Object{
+           {"rangesSupport", true},
+       }},
       {"documentOnTypeFormattingProvider",
        llvm::json::Object{
            {"firstTriggerCharacter", "\n"},
@@ -944,9 +955,17 @@ void ClangdLSPServer::onDocumentOnTypeFormatting(
 void ClangdLSPServer::onDocumentRangeFormatting(
     const DocumentRangeFormattingParams &Params,
     Callback<std::vector<TextEdit>> Reply) {
+  onDocumentRangesFormatting(
+      DocumentRangesFormattingParams{Params.textDocument, {Params.range}},
+      std::move(Reply));
+}
+
+void ClangdLSPServer::onDocumentRangesFormatting(
+    const DocumentRangesFormattingParams &Params,
+    Callback<std::vector<TextEdit>> Reply) {
   auto File = Params.textDocument.uri.file();
   auto Code = Server->getDraft(File);
-  Server->formatFile(File, Params.range,
+  Server->formatFile(File, Params.ranges,
                      [Code = std::move(Code), Reply = std::move(Reply)](
                          llvm::Expected<tooling::Replacements> Result) mutable {
                        if (Result)
@@ -962,7 +981,7 @@ void ClangdLSPServer::onDocumentFormatting(
   auto File = Params.textDocument.uri.file();
   auto Code = Server->getDraft(File);
   Server->formatFile(File,
-                     /*Rng=*/std::nullopt,
+                     /*Rngs=*/{},
                      [Code = std::move(Code), Reply = std::move(Reply)](
                          llvm::Expected<tooling::Replacements> Result) mutable {
                        if (Result)
@@ -1407,19 +1426,22 @@ void ClangdLSPServer::onInlayHint(const InlayHintsParams &Params,
                      std::move(Reply));
 }
 
+void ClangdLSPServer::onCallHierarchyOutgoingCalls(
+    const CallHierarchyOutgoingCallsParams &Params,
+    Callback<std::vector<CallHierarchyOutgoingCall>> Reply) {
+  Server->outgoingCalls(Params.item, std::move(Reply));
+}
+
 void ClangdLSPServer::applyConfiguration(
     const ConfigurationSettings &Settings) {
   // Per-file update to the compilation database.
   llvm::StringSet<> ModifiedFiles;
-  for (auto &Entry : Settings.compilationDatabaseChanges) {
-    PathRef File = Entry.first;
-    auto Old = CDB->getCompileCommand(File);
-    auto New =
-        tooling::CompileCommand(std::move(Entry.second.workingDirectory), File,
-                                std::move(Entry.second.compilationCommand),
+  for (auto &[File, Command] : Settings.compilationDatabaseChanges) {
+    auto Cmd =
+        tooling::CompileCommand(std::move(Command.workingDirectory), File,
+                                std::move(Command.compilationCommand),
                                 /*Output=*/"");
-    if (Old != New) {
-      CDB->setCompileCommand(File, std::move(New));
+    if (CDB->setCompileCommand(File, std::move(Cmd))) {
       ModifiedFiles.insert(File);
     }
   }
@@ -1655,6 +1677,7 @@ void ClangdLSPServer::bindMethods(LSPBinder &Bind,
   Bind.method("shutdown", this, &ClangdLSPServer::onShutdown);
   Bind.method("sync", this, &ClangdLSPServer::onSync);
   Bind.method("textDocument/rangeFormatting", this, &ClangdLSPServer::onDocumentRangeFormatting);
+  Bind.method("textDocument/rangesFormatting", this, &ClangdLSPServer::onDocumentRangesFormatting);
   Bind.method("textDocument/onTypeFormatting", this, &ClangdLSPServer::onDocumentOnTypeFormatting);
   Bind.method("textDocument/formatting", this, &ClangdLSPServer::onDocumentFormatting);
   Bind.method("textDocument/codeAction", this, &ClangdLSPServer::onCodeAction);
@@ -1688,6 +1711,8 @@ void ClangdLSPServer::bindMethods(LSPBinder &Bind,
   Bind.method("typeHierarchy/subtypes", this, &ClangdLSPServer::onSubTypes);
   Bind.method("textDocument/prepareCallHierarchy", this, &ClangdLSPServer::onPrepareCallHierarchy);
   Bind.method("callHierarchy/incomingCalls", this, &ClangdLSPServer::onCallHierarchyIncomingCalls);
+  if (Opts.EnableOutgoingCalls)
+    Bind.method("callHierarchy/outgoingCalls", this, &ClangdLSPServer::onCallHierarchyOutgoingCalls);
   Bind.method("textDocument/selectionRange", this, &ClangdLSPServer::onSelectionRange);
   Bind.method("textDocument/documentLink", this, &ClangdLSPServer::onDocumentLink);
   Bind.method("textDocument/semanticTokens/full", this, &ClangdLSPServer::onSemanticTokens);

@@ -218,6 +218,11 @@ used variables that control features of LLVM and enabled subprojects.
   If you are using an IDE such as Visual Studio or Xcode, you should use
   the IDE settings to set the build type.
 
+  Note: on Windows (building with MSVC or clang-cl), CMake's **RelWithDebInfo**
+  setting does not enable the same optimizations as **Release**. Using the
+  **Release** build type with :ref:`LLVM_ENABLE_PDB <llvm_enable_pdb>` set
+  may be a better option.
+
 **CMAKE_INSTALL_PREFIX**:PATH
   Path where LLVM will be installed when the "install" target is built.
 
@@ -303,6 +308,8 @@ LLVM-related variables
 These variables provide fine control over the build of LLVM and
 enabled sub-projects. Nearly all of these variable names begin with
 ``LLVM_``.
+
+.. _LLVM-related variables BUILD_SHARED_LIBS:
 
 **BUILD_SHARED_LIBS**:BOOL
   Flag indicating if each LLVM component (e.g. Support) is built as a shared
@@ -462,9 +469,6 @@ enabled sub-projects. Nearly all of these variable names begin with
   combination with ``-DLLVM_ENABLE_DOXYGEN_QT_HELP=ON``; otherwise
   it has no effect.
 
-**LLVM_DOXYGEN_SVG**:BOOL
-  Uses .svg files instead of .png files for graphs in the Doxygen output.
-  Defaults to OFF.
 
 .. _llvm_enable_assertions:
 
@@ -474,6 +478,15 @@ enabled sub-projects. Nearly all of these variable names begin with
 
 **LLVM_ENABLE_BINDINGS**:BOOL
   If disabled, do not try to build the OCaml bindings.
+
+**LLVM_ENABLE_DEBUGLOC_COVERAGE_TRACKING**:STRING
+  Enhances Debugify's ability to detect line number errors by storing extra
+  information inside Instructions, removing false positives from Debugify's
+  results at the cost of performance. Allowed values are `DISABLED` (default)
+  and `COVERAGE`. `COVERAGE` tracks whether and why a line number was
+  intentionally dropped or not generated for an instruction, allowing Debugify
+  to avoid reporting these as errors; this comes with a small performance cost
+  of ~0.1%. `COVERAGE` is an ABI-breaking option.
 
 **LLVM_ENABLE_DIA_SDK**:BOOL
   Enable building with MSVC DIA SDK for PDB debugging support. Available
@@ -548,6 +561,12 @@ enabled sub-projects. Nearly all of these variable names begin with
   Compile with `Clang Header Modules
   <https://clang.llvm.org/docs/Modules.html>`_.
 
+.. _llvm_enable_pdb:
+
+**LLVM_ENABLE_PDB**:BOOL
+  For Windows builds using MSVC or clang-cl, generate PDB files when
+  :ref:`CMAKE_BUILD_TYPE <cmake_build_type>` is set to Release.
+
 **LLVM_ENABLE_PEDANTIC**:BOOL
   Enable pedantic mode. This disables compiler-specific extensions, if
   possible. Defaults to ON.
@@ -560,11 +579,18 @@ enabled sub-projects. Nearly all of these variable names begin with
   Semicolon-separated list of projects to build, or *all* for building all
   (clang, lldb, lld, polly, etc) projects. This flag assumes that projects
   are checked out side-by-side and not nested, i.e. clang needs to be in
-  parallel of llvm instead of nested in `llvm/tools`. This feature allows
+  parallel of llvm instead of nested in ``llvm/tools``. This feature allows
   to have one build for only LLVM and another for clang+llvm using the same
   source checkout.
+
   The full list is:
-  ``clang;clang-tools-extra;cross-project-tests;libc;libclc;lld;lldb;openmp;polly;pstl``
+
+  ``bolt;clang;clang-tools-extra;compiler-rt;cross-project-tests;libc;libclc;lld;lldb;mlir;openmp;polly;pstl``
+
+  .. note::
+    Some projects listed here can also go in ``LLVM_ENABLE_RUNTIMES``. They
+    should only appear in one of the two lists. If a project is a valid possibility
+    for both, prefer putting it in ``LLVM_ENABLE_RUNTIMES``.
 
 **LLVM_ENABLE_RTTI**:BOOL
   Build LLVM with run-time type information. Defaults to OFF.
@@ -574,11 +600,17 @@ enabled sub-projects. Nearly all of these variable names begin with
   This is the correct way to build runtimes when putting together a toolchain.
   It will build the builtins separately from the other runtimes to preserve
   correct dependency ordering. If you want to build the runtimes using a system
-  compiler, see the `libc++ documentation <https://libcxx.llvm.org/BuildingLibcxx.html>`_.
-  Note: the list should not have duplicates with `LLVM_ENABLE_PROJECTS`.
+  compiler, see the `libc++ documentation <https://libcxx.llvm.org/VendorDocumentation.html>`_.
+
+  .. note::
+    The list should not have duplicates with ``LLVM_ENABLE_PROJECTS``.
+
   The full list is:
-  ``compiler-rt;libc;libcxx;libcxxabi;libunwind;openmp``
+
+  ``libc;libunwind;libcxxabi;pstl;libcxx;compiler-rt;openmp;llvm-libgcc;offload``
+
   To enable all of them, use:
+
   ``LLVM_ENABLE_RUNTIMES=all``
 
 **LLVM_ENABLE_SPHINX**:BOOL
@@ -639,8 +671,8 @@ enabled sub-projects. Nearly all of these variable names begin with
   Defaults to OFF.
 
 **LLVM_ENABLE_EXPORTED_SYMBOLS_IN_EXECUTABLES**:BOOL
-  When building executables, preserve symbol exports. Defaults to ON. 
-  You can use this option to disable exported symbols from all 
+  When building executables, preserve symbol exports. Defaults to ON.
+  You can use this option to disable exported symbols from all
   executables (Darwin Only).
 
 **LLVM_FORCE_USE_OLD_TOOLCHAIN**:BOOL
@@ -701,7 +733,7 @@ enabled sub-projects. Nearly all of these variable names begin with
   On Windows, allows embedding a different C runtime allocator into the LLVM
   tools and libraries. Using a lock-free allocator such as the ones listed below
   greatly decreases ThinLTO link time by about an order of magnitude. It also
-  midly improves Clang build times, by about 5-10%. At the moment, rpmalloc,
+  mildly improves Clang build times, by about 5-10%. At the moment, rpmalloc,
   snmalloc and mimalloc are supported. Use the path to `git clone` to select
   the respective allocator, for example:
 
@@ -710,8 +742,15 @@ enabled sub-projects. Nearly all of these variable names begin with
     $ D:\git> git clone https://github.com/mjansson/rpmalloc
     $ D:\llvm-project> cmake ... -DLLVM_INTEGRATED_CRT_ALLOC=D:\git\rpmalloc
 
-  This flag needs to be used along with the static CRT, ie. if building the
+  This option needs to be used along with the static CRT, ie. if building the
   Release target, add -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded.
+  Note that rpmalloc is also supported natively in-tree, see option below.
+
+**LLVM_ENABLE_RPMALLOC**:BOOL
+  Similar to LLVM_INTEGRATED_CRT_ALLOC, embeds the in-tree rpmalloc into the
+  host toolchain as a C runtime allocator. The version currently used is
+  rpmalloc 1.4.5. This option also implies linking with the static CRT, there's
+  no need to provide CMAKE_MSVC_RUNTIME_LIBRARY.
 
 **LLVM_LINK_LLVM_DYLIB**:BOOL
   If enabled, tools will be linked with the libLLVM shared library. Defaults
@@ -754,36 +793,28 @@ enabled sub-projects. Nearly all of these variable names begin with
   during the build. Enabling this option can significantly speed up build times
   especially when building LLVM in Debug configurations.
 
-**LLVM_PARALLEL_COMPILE_JOBS**:STRING
-  Define the maximum number of concurrent compilation jobs.
-
-**LLVM_PARALLEL_LINK_JOBS**:STRING
-  Define the maximum number of concurrent link jobs.
-
-**LLVM_PARALLEL_TABLEGEN_JOBS**:STRING
-  Define the maximum number of concurrent tablegen jobs.
+**LLVM_PARALLEL_{COMPILE,LINK,TABLEGEN}_JOBS**:STRING
+  Limit the maximum number of concurrent compilation, link or
+  tablegen jobs respectively. The default total number of parallel jobs is
+  determined by the number of logical CPUs.
 
 **LLVM_PROFDATA_FILE**:PATH
   Path to a profdata file to pass into clang's -fprofile-instr-use flag. This
   can only be specified if you're building with clang.
 
-**LLVM_RAM_PER_COMPILE_JOB**:STRING
-  Calculates the amount of Ninja compile jobs according to available resources.
-  Value has to be in MB, overwrites LLVM_PARALLEL_COMPILE_JOBS. Compile jobs 
-  will be between one and amount of logical cores.
-
-**LLVM_RAM_PER_LINK_JOB**:STRING
-  Calculates the amount of Ninja link jobs according to available resources.
-  Value has to be in MB, overwrites LLVM_PARALLEL_LINK_JOBS. Link jobs will 
-  be between one and amount of logical cores. Link jobs will not run 
-  exclusively therefore you should add an offset of one or two compile jobs 
-  to be sure its not terminated in your memory restricted environment. On ELF
-  platforms also consider ``LLVM_USE_SPLIT_DWARF`` in Debug build.
-
-**LLVM_RAM_PER_TABLEGEN_JOB**:STRING
-  Calculates the amount of Ninja tablegen jobs according to available resources.
-  Value has to be in MB, overwrites LLVM_PARALLEL_TABLEGEN_JOBS. Tablegen jobs
-  will be between one and amount of logical cores.
+**LLVM_RAM_PER_{COMPILE,LINK,TABLEGEN}_JOB**:STRING
+  Limit the number of concurrent compile, link or tablegen jobs
+  respectively, depending on available physical memory. The value
+  specified is in MB. The respective
+  ``LLVM_PARALLEL_{COMPILE,LINK,TABLEGEN}_JOBS`` variable is
+  overwritten by computing the memory size divided by the
+  specified value. The largest memory user is linking, but remember
+  that jobs in the other categories might run in parallel to the link
+  jobs, and you need to consider their memory requirements when
+  in a memory-limited environment. Using a
+  ``-DLLVM_RAM_PER_LINK_JOB=10000`` is a good approximation. On ELF
+  platforms debug builds can reduce link-time memory pressure by also
+  using ``LLVM_USE_SPLIT_DWARF``.
 
 **LLVM_REVERSE_ITERATION**:BOOL
   If enabled, all supported unordered llvm containers would be iterated in
@@ -812,6 +843,12 @@ enabled sub-projects. Nearly all of these variable names begin with
   ``-DLLVM_TARGETS_TO_BUILD="X86;PowerPC"``.
   The full list, as of March 2023, is:
   ``AArch64;AMDGPU;ARM;AVR;BPF;Hexagon;Lanai;LoongArch;Mips;MSP430;NVPTX;PowerPC;RISCV;Sparc;SystemZ;VE;WebAssembly;X86;XCore``
+
+  You can also specify ``host`` or ``Native`` to automatically detect and
+  include the target corresponding to the host machine's architecture, or
+  use ``all`` to include all available targets.
+  For example, on an x86_64 machine, specifying ``-DLLVM_TARGETS_TO_BUILD=host``
+  will include the ``X86`` target.
 
 **LLVM_TEMPORARILY_ALLOW_OLD_TOOLCHAIN**:BOOL
   If enabled, the compiler version check will only warn when using a toolchain
@@ -1151,16 +1188,6 @@ Windows
   Studio 2010 CMake generator. 0 means use all processors. Default is 0.
 
 **CMAKE_MT**:STRING
-  When compiling with clang-cl, recent CMake versions will default to selecting
-  `llvm-mt` as the Manifest Tool instead of Microsoft's `mt.exe`. This will
-  often cause errors like:
-
-  .. code-block:: console
-
-    -- Check for working C compiler: [...]clang-cl.exe - broken
-    [...]
-        MT: command [...] failed (exit code 0x1) with the following output:
-        llvm-mt: error: no libxml2
-        ninja: build stopped: subcommand failed.
-
-  To work around this error, set `CMAKE_MT=mt`.
+  When compiling with clang-cl, CMake may use `llvm-mt` as the Manifest Tool
+  when available. `llvm-mt` is only present when libxml2 is found at build-time.
+  To ensure using Microsoft's Manifest Tool set `CMAKE_MT=mt`.

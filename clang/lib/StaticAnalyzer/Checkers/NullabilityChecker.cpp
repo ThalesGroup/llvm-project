@@ -69,6 +69,7 @@ const char *getNullabilityString(Nullability Nullab) {
 }
 
 // These enums are used as an index to ErrorMessages array.
+// FIXME: ErrorMessages no longer exists, perhaps remove this as well?
 enum class ErrorKind : int {
   NilAssignedToNonnull,
   NilPassedToNonnull,
@@ -692,6 +693,14 @@ void NullabilityChecker::checkPreStmt(const ReturnStmt *S,
   NullConstraint Nullness = getNullConstraint(*RetSVal, State);
 
   Nullability RequiredNullability = getNullabilityAnnotation(RequiredRetType);
+  if (const auto *FunDecl = C.getLocationContext()->getDecl();
+      FunDecl && FunDecl->getAttr<ReturnsNonNullAttr>() &&
+      (RequiredNullability == Nullability::Unspecified ||
+       RequiredNullability == Nullability::Nullable)) {
+    // If a function is marked with the returns_nonnull attribute,
+    // the return value must be non-null.
+    RequiredNullability = Nullability::Nonnull;
+  }
 
   // If the returned value is null but the type of the expression
   // generating it is nonnull then we will suppress the diagnostic.
@@ -705,9 +714,8 @@ void NullabilityChecker::checkPreStmt(const ReturnStmt *S,
                                   Nullness == NullConstraint::IsNull);
   if (ChecksEnabled[CK_NullReturnedFromNonnull] && NullReturnedFromNonNull &&
       RetExprTypeLevelNullability != Nullability::Nonnull &&
-      !InSuppressedMethodFamily && C.getLocationContext()->inTopFrame()) {
-    static CheckerProgramPointTag Tag(this, "NullReturnedFromNonnull");
-    ExplodedNode *N = C.generateErrorNode(State, &Tag);
+      !InSuppressedMethodFamily) {
+    ExplodedNode *N = C.generateErrorNode(State);
     if (!N)
       return;
 
@@ -742,8 +750,7 @@ void NullabilityChecker::checkPreStmt(const ReturnStmt *S,
         Nullness != NullConstraint::IsNotNull &&
         TrackedNullabValue == Nullability::Nullable &&
         RequiredNullability == Nullability::Nonnull) {
-      static CheckerProgramPointTag Tag(this, "NullableReturnedFromNonnull");
-      ExplodedNode *N = C.addTransition(State, C.getPredecessor(), &Tag);
+      ExplodedNode *N = C.addTransition(State, C.getPredecessor());
 
       SmallString<256> SBuf;
       llvm::raw_svector_ostream OS(SBuf);
@@ -1291,8 +1298,7 @@ void NullabilityChecker::checkBind(SVal L, SVal V, const Stmt *S,
       ValNullability != Nullability::Nonnull &&
       ValueExprTypeLevelNullability != Nullability::Nonnull &&
       !isARCNilInitializedLocal(C, S)) {
-    static CheckerProgramPointTag Tag(this, "NullPassedToNonnull");
-    ExplodedNode *N = C.generateErrorNode(State, &Tag);
+    ExplodedNode *N = C.generateErrorNode(State);
     if (!N)
       return;
 
@@ -1334,8 +1340,7 @@ void NullabilityChecker::checkBind(SVal L, SVal V, const Stmt *S,
       return;
     if (ChecksEnabled[CK_NullablePassedToNonnull] &&
         LocNullability == Nullability::Nonnull) {
-      static CheckerProgramPointTag Tag(this, "NullablePassedToNonnull");
-      ExplodedNode *N = C.addTransition(State, C.getPredecessor(), &Tag);
+      ExplodedNode *N = C.addTransition(State, C.getPredecessor());
       reportBugIfInvariantHolds("Nullable pointer is assigned to a pointer "
                                 "which is expected to have non-null value",
                                 ErrorKind::NullableAssignedToNonnull,

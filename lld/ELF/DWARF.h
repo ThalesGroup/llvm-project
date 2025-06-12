@@ -10,6 +10,7 @@
 #define LLD_ELF_DWARF_H
 
 #include "InputFiles.h"
+#include "InputSection.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
@@ -62,6 +63,9 @@ public:
   const LLDDWARFSection &getGnuPubtypesSection() const override {
     return gnuPubtypesSection;
   }
+  const LLDDWARFSection &getNamesSection() const override {
+    return namesSection;
+  }
 
   StringRef getFileName() const override { return ""; }
   StringRef getAbbrevSection() const override { return abbrevSection; }
@@ -87,6 +91,7 @@ private:
   LLDDWARFSection infoSection;
   LLDDWARFSection lineSection;
   LLDDWARFSection loclistsSection;
+  LLDDWARFSection namesSection;
   LLDDWARFSection rangesSection;
   LLDDWARFSection rnglistsSection;
   LLDDWARFSection strOffsetsSection;

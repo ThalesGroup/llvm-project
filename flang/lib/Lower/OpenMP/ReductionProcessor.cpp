@@ -14,6 +14,7 @@
 
 #include "flang/Lower/AbstractConverter.h"
 #include "flang/Lower/ConvertType.h"
+#include "flang/Lower/Support/PrivateReductionUtils.h"
 #include "flang/Lower/SymbolMap.h"
 #include "flang/Optimizer/Builder/Complex.h"
 #include "flang/Optimizer/Builder/HLFIRTools.h"
@@ -24,20 +25,55 @@
 #include "flang/Parser/tools.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "llvm/Support/CommandLine.h"
+#include <type_traits>
 
 static llvm::cl::opt<bool> forceByrefReduction(
     "force-byref-reduction",
     llvm::cl::desc("Pass all reduction arguments by reference"),
     llvm::cl::Hidden);
 
+using ReductionModifier =
+    Fortran::lower::omp::clause::Reduction::ReductionModifier;
+
 namespace Fortran {
 namespace lower {
 namespace omp {
 
+// explicit template declarations
+template void
+ReductionProcessor::processReductionArguments<omp::clause::Reduction>(
+    mlir::Location currentLocation, lower::AbstractConverter &converter,
+    const omp::clause::Reduction &reduction,
+    llvm::SmallVectorImpl<mlir::Value> &reductionVars,
+    llvm::SmallVectorImpl<bool> &reduceVarByRef,
+    llvm::SmallVectorImpl<mlir::Attribute> &reductionDeclSymbols,
+    llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSymbols,
+    mlir::omp::ReductionModifierAttr *reductionMod);
+
+template void
+ReductionProcessor::processReductionArguments<omp::clause::TaskReduction>(
+    mlir::Location currentLocation, lower::AbstractConverter &converter,
+    const omp::clause::TaskReduction &reduction,
+    llvm::SmallVectorImpl<mlir::Value> &reductionVars,
+    llvm::SmallVectorImpl<bool> &reduceVarByRef,
+    llvm::SmallVectorImpl<mlir::Attribute> &reductionDeclSymbols,
+    llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSymbols,
+    mlir::omp::ReductionModifierAttr *reductionMod);
+
+template void
+ReductionProcessor::processReductionArguments<omp::clause::InReduction>(
+    mlir::Location currentLocation, lower::AbstractConverter &converter,
+    const omp::clause::InReduction &reduction,
+    llvm::SmallVectorImpl<mlir::Value> &reductionVars,
+    llvm::SmallVectorImpl<bool> &reduceVarByRef,
+    llvm::SmallVectorImpl<mlir::Attribute> &reductionDeclSymbols,
+    llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSymbols,
+    mlir::omp::ReductionModifierAttr *reductionMod);
+
 ReductionProcessor::ReductionIdentifier ReductionProcessor::getReductionType(
     const omp::clause::ProcedureDesignator &pd) {
   auto redType = llvm::StringSwitch<std::optional<ReductionIdentifier>>(
-                     getRealName(pd.v.id()).ToString())
+                     getRealName(pd.v.sym()).ToString())
                      .Case("max", ReductionIdentifier::MAX)
                      .Case("min", ReductionIdentifier::MIN)
                      .Case("iand", ReductionIdentifier::IAND)
@@ -72,8 +108,8 @@ ReductionProcessor::ReductionIdentifier ReductionProcessor::getReductionType(
 
 bool ReductionProcessor::supportedIntrinsicProcReduction(
     const omp::clause::ProcedureDesignator &pd) {
-  Fortran::semantics::Symbol *sym = pd.v.id();
-  if (!sym->GetUltimate().attrs().test(Fortran::semantics::Attr::INTRINSIC))
+  semantics::Symbol *sym = pd.v.sym();
+  if (!sym->GetUltimate().attrs().test(semantics::Attr::INTRINSIC))
     return false;
   auto redType = llvm::StringSwitch<bool>(getRealName(sym).ToString())
                      .Case("max", true)
@@ -138,7 +174,7 @@ ReductionProcessor::getReductionInitValue(mlir::Location loc, mlir::Type type,
     TODO(loc, "Reduction of some types is not supported");
   switch (redId) {
   case ReductionIdentifier::MAX: {
-    if (auto ty = type.dyn_cast<mlir::FloatType>()) {
+    if (auto ty = mlir::dyn_cast<mlir::FloatType>(type)) {
       const llvm::fltSemantics &sem = ty.getFloatSemantics();
       return builder.createRealConstant(
           loc, type, llvm::APFloat::getLargest(sem, /*Negative=*/true));
@@ -148,7 +184,7 @@ ReductionProcessor::getReductionInitValue(mlir::Location loc, mlir::Type type,
     return builder.createIntegerConstant(loc, type, minInt);
   }
   case ReductionIdentifier::MIN: {
-    if (auto ty = type.dyn_cast<mlir::FloatType>()) {
+    if (auto ty = mlir::dyn_cast<mlir::FloatType>(type)) {
       const llvm::fltSemantics &sem = ty.getFloatSemantics();
       return builder.createRealConstant(
           loc, type, llvm::APFloat::getLargest(sem, /*Negative=*/false));
@@ -178,9 +214,8 @@ ReductionProcessor::getReductionInitValue(mlir::Location loc, mlir::Type type,
   case ReductionIdentifier::OR:
   case ReductionIdentifier::EQV:
   case ReductionIdentifier::NEQV:
-    if (auto cplxTy = mlir::dyn_cast<fir::ComplexType>(type)) {
-      mlir::Type realTy =
-          Fortran::lower::convertReal(builder.getContext(), cplxTy.getFKind());
+    if (auto cplxTy = mlir::dyn_cast<mlir::ComplexType>(type)) {
+      mlir::Type realTy = cplxTy.getElementType();
       mlir::Value initRe = builder.createRealConstant(
           loc, realTy, getOperationIdentity(redId, loc));
       mlir::Value initIm = builder.createRealConstant(loc, realTy, 0);
@@ -188,12 +223,12 @@ ReductionProcessor::getReductionInitValue(mlir::Location loc, mlir::Type type,
       return fir::factory::Complex{builder, loc}.createComplex(type, initRe,
                                                                initIm);
     }
-    if (type.isa<mlir::FloatType>())
+    if (mlir::isa<mlir::FloatType>(type))
       return builder.create<mlir::arith::ConstantOp>(
           loc, type,
           builder.getFloatAttr(type, (double)getOperationIdentity(redId, loc)));
 
-    if (type.isa<fir::LogicalType>()) {
+    if (mlir::isa<fir::LogicalType>(type)) {
       mlir::Value intConst = builder.create<mlir::arith::ConstantOp>(
           loc, builder.getI1Type(),
           builder.getIntegerAttr(builder.getI1Type(),
@@ -220,12 +255,12 @@ mlir::Value ReductionProcessor::createScalarCombiner(
   switch (redId) {
   case ReductionIdentifier::MAX:
     reductionOp =
-        getReductionOperation<mlir::arith::MaximumFOp, mlir::arith::MaxSIOp>(
+        getReductionOperation<mlir::arith::MaxNumFOp, mlir::arith::MaxSIOp>(
             builder, type, loc, op1, op2);
     break;
   case ReductionIdentifier::MIN:
     reductionOp =
-        getReductionOperation<mlir::arith::MinimumFOp, mlir::arith::MinSIOp>(
+        getReductionOperation<mlir::arith::MinNumFOp, mlir::arith::MinSIOp>(
             builder, type, loc, op1, op2);
     break;
   case ReductionIdentifier::IOR:
@@ -301,10 +336,13 @@ static void genBoxCombiner(fir::FirOpBuilder &builder, mlir::Location loc,
                            ReductionProcessor::ReductionIdentifier redId,
                            fir::BaseBoxType boxTy, mlir::Value lhs,
                            mlir::Value rhs) {
-  fir::SequenceType seqTy =
-      mlir::dyn_cast_or_null<fir::SequenceType>(boxTy.getEleTy());
-  // TODO: support allocatable arrays: !fir.box<!fir.heap<!fir.array<...>>>
-  if (!seqTy || seqTy.hasUnknownShape())
+  fir::SequenceType seqTy = mlir::dyn_cast_or_null<fir::SequenceType>(
+      fir::unwrapRefType(boxTy.getEleTy()));
+  fir::HeapType heapTy =
+      mlir::dyn_cast_or_null<fir::HeapType>(boxTy.getEleTy());
+  fir::PointerType ptrTy =
+      mlir::dyn_cast_or_null<fir::PointerType>(boxTy.getEleTy());
+  if ((!seqTy || seqTy.hasUnknownShape()) && !heapTy && !ptrTy)
     TODO(loc, "Unsupported boxed type in OpenMP reduction");
 
   // load fir.ref<fir.box<...>>
@@ -312,40 +350,47 @@ static void genBoxCombiner(fir::FirOpBuilder &builder, mlir::Location loc,
   lhs = builder.create<fir::LoadOp>(loc, lhs);
   rhs = builder.create<fir::LoadOp>(loc, rhs);
 
-  const unsigned rank = seqTy.getDimension();
-  llvm::SmallVector<mlir::Value> extents;
-  extents.reserve(rank);
-  llvm::SmallVector<mlir::Value> lbAndExtents;
-  lbAndExtents.reserve(rank * 2);
+  if ((heapTy || ptrTy) && !seqTy) {
+    // get box contents (heap pointers)
+    lhs = builder.create<fir::BoxAddrOp>(loc, lhs);
+    rhs = builder.create<fir::BoxAddrOp>(loc, rhs);
+    mlir::Value lhsValAddr = lhs;
 
-  // Get box lowerbounds and extents:
-  mlir::Type idxTy = builder.getIndexType();
-  for (unsigned i = 0; i < rank; ++i) {
-    // TODO: ideally we want to hoist box reads out of the critical section.
-    // We could do this by having box dimensions in block arguments like
-    // OpenACC does
-    mlir::Value dim = builder.createIntegerConstant(loc, idxTy, i);
-    auto dimInfo =
-        builder.create<fir::BoxDimsOp>(loc, idxTy, idxTy, idxTy, lhs, dim);
-    extents.push_back(dimInfo.getExtent());
-    lbAndExtents.push_back(dimInfo.getLowerBound());
-    lbAndExtents.push_back(dimInfo.getExtent());
+    // load heap pointers
+    lhs = builder.create<fir::LoadOp>(loc, lhs);
+    rhs = builder.create<fir::LoadOp>(loc, rhs);
+
+    mlir::Type eleTy = heapTy ? heapTy.getEleTy() : ptrTy.getEleTy();
+
+    mlir::Value result = ReductionProcessor::createScalarCombiner(
+        builder, loc, redId, eleTy, lhs, rhs);
+    builder.create<fir::StoreOp>(loc, result, lhsValAddr);
+    builder.create<mlir::omp::YieldOp>(loc, lhsAddr);
+    return;
   }
 
-  auto shapeShiftTy = fir::ShapeShiftType::get(builder.getContext(), rank);
-  auto shapeShift =
-      builder.create<fir::ShapeShiftOp>(loc, shapeShiftTy, lbAndExtents);
+  // Get ShapeShift with default lower bounds. This makes it possible to use
+  // unmodified LoopNest's indices with ArrayCoorOp.
+  fir::ShapeShiftOp shapeShift =
+      getShapeShift(builder, loc, lhs,
+                    /*cannotHaveNonDefaultLowerBounds=*/false,
+                    /*useDefaultLowerBounds=*/true);
 
   // Iterate over array elements, applying the equivalent scalar reduction:
+
+  // F2018 5.4.10.2: Unallocated allocatable variables may not be referenced
+  // and so no null check is needed here before indexing into the (possibly
+  // allocatable) arrays.
 
   // A hlfir::elemental here gets inlined with a temporary so create the
   // loop nest directly.
   // This function already controls all of the code in this region so we
   // know this won't miss any opportuinties for clever elemental inlining
-  hlfir::LoopNest nest =
-      hlfir::genLoopNest(loc, builder, extents, /*isUnordered=*/true);
-  builder.setInsertionPointToStart(nest.innerLoop.getBody());
-  mlir::Type refTy = fir::ReferenceType::get(seqTy.getEleTy());
+  hlfir::LoopNest nest = hlfir::genLoopNest(
+      loc, builder, shapeShift.getExtents(), /*isUnordered=*/true);
+  builder.setInsertionPointToStart(nest.body);
+  const bool seqIsVolatile = fir::isa_volatile_type(seqTy.getEleTy());
+  mlir::Type refTy = fir::ReferenceType::get(seqTy.getEleTy(), seqIsVolatile);
   auto lhsEleAddr = builder.create<fir::ArrayCoorOp>(
       loc, refTy, lhs, shapeShift, /*slice=*/mlir::Value{},
       nest.oneBasedIndices, /*typeparms=*/mlir::ValueRange{});
@@ -358,7 +403,7 @@ static void genBoxCombiner(fir::FirOpBuilder &builder, mlir::Location loc,
       builder, loc, redId, refTy, lhsEle, rhsEle);
   builder.create<fir::StoreOp>(loc, scalarReduction, lhsEleAddr);
 
-  builder.setInsertionPointAfter(nest.outerLoop);
+  builder.setInsertionPointAfter(nest.outerOp);
   builder.create<mlir::omp::YieldOp>(loc, lhsAddr);
 }
 
@@ -392,120 +437,82 @@ static void genCombiner(fir::FirOpBuilder &builder, mlir::Location loc,
   TODO(loc, "OpenMP genCombiner for unsupported reduction variable type");
 }
 
-static void
-createReductionCleanupRegion(fir::FirOpBuilder &builder, mlir::Location loc,
-                             mlir::omp::DeclareReductionOp &reductionDecl) {
-  mlir::Type redTy = reductionDecl.getType();
-
-  mlir::Region &cleanupRegion = reductionDecl.getCleanupRegion();
-  assert(cleanupRegion.empty());
-  mlir::Block *block =
-      builder.createBlock(&cleanupRegion, cleanupRegion.end(), {redTy}, {loc});
-  builder.setInsertionPointToEnd(block);
-
-  auto typeError = [loc]() {
-    fir::emitFatalError(loc,
-                        "Attempt to create an omp reduction cleanup region "
-                        "for a type that wasn't allocated",
-                        /*genCrashDiag=*/true);
-  };
-
-  mlir::Type valTy = fir::unwrapRefType(redTy);
-  if (auto boxTy = mlir::dyn_cast_or_null<fir::BaseBoxType>(valTy)) {
-    mlir::Type innerTy = fir::extractSequenceType(boxTy);
-    if (!mlir::isa<fir::SequenceType>(innerTy))
-      typeError();
-
-    mlir::Value arg = block->getArgument(0);
-    arg = builder.loadIfRef(loc, arg);
-    assert(mlir::isa<fir::BaseBoxType>(arg.getType()));
-
-    // Deallocate box
-    // The FIR type system doesn't nesecarrily know that this is a mutable box
-    // if we allocated the thread local array on the heap to avoid looped stack
-    // allocations.
-    mlir::Value addr =
-        hlfir::genVariableRawAddress(loc, builder, hlfir::Entity{arg});
-    mlir::Value isAllocated = builder.genIsNotNullAddr(loc, addr);
-    fir::IfOp ifOp =
-        builder.create<fir::IfOp>(loc, isAllocated, /*withElseRegion=*/false);
-    builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
-
-    mlir::Value cast = builder.createConvert(
-        loc, fir::HeapType::get(fir::dyn_cast_ptrEleTy(addr.getType())), addr);
-    builder.create<fir::FreeMemOp>(loc, cast);
-
-    builder.setInsertionPointAfter(ifOp);
-    builder.create<mlir::omp::YieldOp>(loc);
-    return;
+// like fir::unwrapSeqOrBoxedSeqType except it also works for non-sequence boxes
+static mlir::Type unwrapSeqOrBoxedType(mlir::Type ty) {
+  if (auto seqTy = mlir::dyn_cast<fir::SequenceType>(ty))
+    return seqTy.getEleTy();
+  if (auto boxTy = mlir::dyn_cast<fir::BaseBoxType>(ty)) {
+    auto eleTy = fir::unwrapRefType(boxTy.getEleTy());
+    if (auto seqTy = mlir::dyn_cast<fir::SequenceType>(eleTy))
+      return seqTy.getEleTy();
+    return eleTy;
   }
-
-  typeError();
+  return ty;
 }
 
-static mlir::Value
-createReductionInitRegion(fir::FirOpBuilder &builder, mlir::Location loc,
-                          mlir::omp::DeclareReductionOp &reductionDecl,
-                          const ReductionProcessor::ReductionIdentifier redId,
-                          mlir::Type type, bool isByRef) {
+static void createReductionAllocAndInitRegions(
+    AbstractConverter &converter, mlir::Location loc,
+    mlir::omp::DeclareReductionOp &reductionDecl,
+    const ReductionProcessor::ReductionIdentifier redId, mlir::Type type,
+    bool isByRef) {
+  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
+  auto yield = [&](mlir::Value ret) {
+    builder.create<mlir::omp::YieldOp>(loc, ret);
+  };
+
+  mlir::Block *allocBlock = nullptr;
+  mlir::Block *initBlock = nullptr;
+  if (isByRef) {
+    allocBlock =
+        builder.createBlock(&reductionDecl.getAllocRegion(),
+                            reductionDecl.getAllocRegion().end(), {}, {});
+    initBlock = builder.createBlock(&reductionDecl.getInitializerRegion(),
+                                    reductionDecl.getInitializerRegion().end(),
+                                    {type, type}, {loc, loc});
+  } else {
+    initBlock = builder.createBlock(&reductionDecl.getInitializerRegion(),
+                                    reductionDecl.getInitializerRegion().end(),
+                                    {type}, {loc});
+  }
+
   mlir::Type ty = fir::unwrapRefType(type);
+  builder.setInsertionPointToEnd(initBlock);
   mlir::Value initValue = ReductionProcessor::getReductionInitValue(
-      loc, fir::unwrapSeqOrBoxedSeqType(ty), redId, builder);
+      loc, unwrapSeqOrBoxedType(ty), redId, builder);
+
+  if (isByRef) {
+    populateByRefInitAndCleanupRegions(
+        converter, loc, type, initValue, initBlock,
+        reductionDecl.getInitializerAllocArg(),
+        reductionDecl.getInitializerMoldArg(), reductionDecl.getCleanupRegion(),
+        DeclOperationKind::Reduction);
+  }
 
   if (fir::isa_trivial(ty)) {
     if (isByRef) {
+      // alloc region
+      builder.setInsertionPointToEnd(allocBlock);
       mlir::Value alloca = builder.create<fir::AllocaOp>(loc, ty);
-      builder.createStoreWithConvert(loc, initValue, alloca);
-      return alloca;
+      yield(alloca);
+      return;
     }
     // by val
-    return initValue;
+    yield(initValue);
+    return;
   }
+  assert(isByRef && "passing non-trivial types by val is unsupported");
 
-  // all arrays are boxed
-  if (auto boxTy = mlir::dyn_cast_or_null<fir::BaseBoxType>(ty)) {
-    assert(isByRef && "passing arrays by value is unsupported");
-    // TODO: support allocatable arrays: !fir.box<!fir.heap<!fir.array<...>>>
-    mlir::Type innerTy = fir::extractSequenceType(boxTy);
-    if (!mlir::isa<fir::SequenceType>(innerTy))
-      TODO(loc, "Unsupported boxed type for reduction");
-    // Create the private copy from the initial fir.box:
-    hlfir::Entity source = hlfir::Entity{builder.getBlock()->getArgument(0)};
-
-    // Allocating on the heap in case the whole reduction is nested inside of a
-    // loop
-    // TODO: compare performance here to using allocas - this could be made to
-    // work by inserting stacksave/stackrestore around the reduction in
-    // openmpirbuilder
-    auto [temp, needsDealloc] = createTempFromMold(loc, builder, source);
-    // if needsDealloc isn't statically false, add cleanup region. TODO: always
-    // do this for allocatable boxes because they might have been re-allocated
-    // in the body of the loop/parallel region
-    std::optional<int64_t> cstNeedsDealloc =
-        fir::getIntIfConstant(needsDealloc);
-    assert(cstNeedsDealloc.has_value() &&
-           "createTempFromMold decides this statically");
-    if (cstNeedsDealloc.has_value() && *cstNeedsDealloc != false) {
-      auto insPt = builder.saveInsertionPoint();
-      createReductionCleanupRegion(builder, loc, reductionDecl);
-      builder.restoreInsertionPoint(insPt);
-    }
-
-    // Put the temporary inside of a box:
-    hlfir::Entity box = hlfir::genVariableBox(loc, builder, temp);
-    builder.create<hlfir::AssignOp>(loc, initValue, box);
-    mlir::Value boxAlloca = builder.create<fir::AllocaOp>(loc, ty);
-    builder.create<fir::StoreOp>(loc, box, boxAlloca);
-    return boxAlloca;
-  }
-
-  TODO(loc, "createReductionInitRegion for unsupported type");
+  // alloc region
+  builder.setInsertionPointToEnd(allocBlock);
+  mlir::Value boxAlloca = builder.create<fir::AllocaOp>(loc, ty);
+  yield(boxAlloca);
 }
 
 mlir::omp::DeclareReductionOp ReductionProcessor::createDeclareReduction(
-    fir::FirOpBuilder &builder, llvm::StringRef reductionOpName,
+    AbstractConverter &converter, llvm::StringRef reductionOpName,
     const ReductionIdentifier redId, mlir::Type type, mlir::Location loc,
     bool isByRef) {
+  fir::FirOpBuilder &builder = converter.getFirOpBuilder();
   mlir::OpBuilder::InsertionGuard guard(builder);
   mlir::ModuleOp module = builder.getModule();
 
@@ -523,13 +530,8 @@ mlir::omp::DeclareReductionOp ReductionProcessor::createDeclareReduction(
 
   decl = modBuilder.create<mlir::omp::DeclareReductionOp>(loc, reductionOpName,
                                                           type);
-  builder.createBlock(&decl.getInitializerRegion(),
-                      decl.getInitializerRegion().end(), {type}, {loc});
-  builder.setInsertionPointToEnd(&decl.getInitializerRegion().back());
-
-  mlir::Value init =
-      createReductionInitRegion(builder, loc, decl, redId, type, isByRef);
-  builder.create<mlir::omp::YieldOp>(loc, init);
+  createReductionAllocAndInitRegions(converter, loc, decl, redId, type,
+                                     isByRef);
 
   builder.createBlock(&decl.getReductionRegion(),
                       decl.getReductionRegion().end(), {type, type},
@@ -543,45 +545,56 @@ mlir::omp::DeclareReductionOp ReductionProcessor::createDeclareReduction(
   return decl;
 }
 
-// TODO: By-ref vs by-val reductions are currently toggled for the whole
-//       operation (possibly effecting multiple reduction variables).
-//       This could cause a problem with openmp target reductions because
-//       by-ref trivial types may not be supported.
-bool ReductionProcessor::doReductionByRef(
-    const llvm::SmallVectorImpl<mlir::Value> &reductionVars) {
-  if (reductionVars.empty())
-    return false;
+static bool doReductionByRef(mlir::Value reductionVar) {
   if (forceByrefReduction)
     return true;
 
-  for (mlir::Value reductionVar : reductionVars) {
-    if (auto declare =
-            mlir::dyn_cast<hlfir::DeclareOp>(reductionVar.getDefiningOp()))
-      reductionVar = declare.getMemref();
+  if (auto declare =
+          mlir::dyn_cast<hlfir::DeclareOp>(reductionVar.getDefiningOp()))
+    reductionVar = declare.getMemref();
 
-    if (!fir::isa_trivial(fir::unwrapRefType(reductionVar.getType())))
-      return true;
-  }
+  if (!fir::isa_trivial(fir::unwrapRefType(reductionVar.getType())))
+    return true;
+
   return false;
 }
 
-void ReductionProcessor::addDeclareReduction(
-    mlir::Location currentLocation,
-    Fortran::lower::AbstractConverter &converter,
-    const omp::clause::Reduction &reduction,
-    llvm::SmallVectorImpl<mlir::Value> &reductionVars,
+mlir::omp::ReductionModifier translateReductionModifier(ReductionModifier mod) {
+  switch (mod) {
+  case ReductionModifier::Default:
+    return mlir::omp::ReductionModifier::defaultmod;
+  case ReductionModifier::Inscan:
+    return mlir::omp::ReductionModifier::inscan;
+  case ReductionModifier::Task:
+    return mlir::omp::ReductionModifier::task;
+  }
+  return mlir::omp::ReductionModifier::defaultmod;
+}
+
+template <class T>
+void ReductionProcessor::processReductionArguments(
+    mlir::Location currentLocation, lower::AbstractConverter &converter,
+    const T &reduction, llvm::SmallVectorImpl<mlir::Value> &reductionVars,
+    llvm::SmallVectorImpl<bool> &reduceVarByRef,
     llvm::SmallVectorImpl<mlir::Attribute> &reductionDeclSymbols,
-    llvm::SmallVectorImpl<const Fortran::semantics::Symbol *>
-        *reductionSymbols) {
+    llvm::SmallVectorImpl<const semantics::Symbol *> &reductionSymbols,
+    mlir::omp::ReductionModifierAttr *reductionMod) {
   fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
 
-  if (std::get<std::optional<omp::clause::Reduction::ReductionModifier>>(
-          reduction.t))
-    TODO(currentLocation, "Reduction modifiers are not supported");
+  if constexpr (std::is_same_v<T, omp::clause::Reduction>) {
+    auto mod = std::get<std::optional<ReductionModifier>>(reduction.t);
+    if (mod.has_value()) {
+      if (mod.value() == ReductionModifier::Task)
+        TODO(currentLocation, "Reduction modifier `task` is not supported");
+      else
+        *reductionMod = mlir::omp::ReductionModifierAttr::get(
+            firOpBuilder.getContext(), translateReductionModifier(mod.value()));
+    }
+  }
 
   mlir::omp::DeclareReductionOp decl;
   const auto &redOperatorList{
-      std::get<omp::clause::Reduction::ReductionIdentifiers>(reduction.t)};
+      std::get<typename T::ReductionIdentifiers>(reduction.t)};
   assert(redOperatorList.size() == 1 && "Expecting single operator");
   const auto &redOperator = redOperatorList.front();
   const auto &objectList{std::get<omp::ObjectList>(reduction.t)};
@@ -598,13 +611,12 @@ void ReductionProcessor::addDeclareReduction(
     }
   }
 
-  // initial pass to collect all reduction vars so we can figure out if this
-  // should happen byref
+  // Reduction variable processing common to both intrinsic operators and
+  // procedure designators
   fir::FirOpBuilder &builder = converter.getFirOpBuilder();
   for (const Object &object : objectList) {
-    const Fortran::semantics::Symbol *symbol = object.id();
-    if (reductionSymbols)
-      reductionSymbols->push_back(symbol);
+    const semantics::Symbol *symbol = object.sym();
+    reductionSymbols.push_back(symbol);
     mlir::Value symVal = converter.getSymbolAddress(*symbol);
     mlir::Type eleType;
     auto refType = mlir::dyn_cast_or_null<fir::ReferenceType>(symVal.getType());
@@ -617,8 +629,7 @@ void ReductionProcessor::addDeclareReduction(
     // information needed to iterate over the array
     if (mlir::isa<fir::SequenceType>(eleType)) {
       // For Host associated symbols, use `SymbolBox` instead
-      Fortran::lower::SymbolBox symBox =
-          converter.lookupOneLevelUpSymbol(*symbol);
+      lower::SymbolBox symBox = converter.lookupOneLevelUpSymbol(*symbol);
       hlfir::Entity entity{symBox.getAddr()};
       entity = genVariableBox(currentLocation, builder, entity);
       mlir::Value box = entity.getBase();
@@ -646,85 +657,78 @@ void ReductionProcessor::addDeclareReduction(
     // this isn't the same as the by-val and by-ref passing later in the
     // pipeline. Both styles assume that the variable is a reference at
     // this point
-    assert(mlir::isa<fir::ReferenceType>(symVal.getType()) &&
-           "reduction input var is a reference");
+    assert(fir::isa_ref_type(symVal.getType()) &&
+           "reduction input var is passed by reference");
+    mlir::Type elementType = fir::dyn_cast_ptrEleTy(symVal.getType());
+    const bool symIsVolatile = fir::isa_volatile_type(symVal.getType());
+    mlir::Type refTy = fir::ReferenceType::get(elementType, symIsVolatile);
 
-    reductionVars.push_back(symVal);
+    reductionVars.push_back(
+        builder.createConvert(currentLocation, refTy, symVal));
+    reduceVarByRef.push_back(doReductionByRef(symVal));
   }
-  const bool isByRef = doReductionByRef(reductionVars);
 
-  if (const auto &redDefinedOp =
-          std::get_if<omp::clause::DefinedOperator>(&redOperator.u)) {
-    const auto &intrinsicOp{
-        std::get<omp::clause::DefinedOperator::IntrinsicOperator>(
-            redDefinedOp->u)};
-    ReductionIdentifier redId = getReductionType(intrinsicOp);
-    switch (redId) {
-    case ReductionIdentifier::ADD:
-    case ReductionIdentifier::MULTIPLY:
-    case ReductionIdentifier::AND:
-    case ReductionIdentifier::EQV:
-    case ReductionIdentifier::OR:
-    case ReductionIdentifier::NEQV:
-      break;
-    default:
-      TODO(currentLocation,
-           "Reduction of some intrinsic operators is not supported");
-      break;
-    }
+  for (auto [symVal, isByRef] : llvm::zip(reductionVars, reduceVarByRef)) {
+    auto redType = mlir::cast<fir::ReferenceType>(symVal.getType());
+    const auto &kindMap = firOpBuilder.getKindMap();
+    std::string reductionName;
+    ReductionIdentifier redId;
+    mlir::Type redNameTy = redType;
+    if (mlir::isa<fir::LogicalType>(redType.getEleTy()))
+      redNameTy = builder.getI1Type();
 
-    for (mlir::Value symVal : reductionVars) {
-      auto redType = mlir::cast<fir::ReferenceType>(symVal.getType());
-      const auto &kindMap = firOpBuilder.getKindMap();
-      if (redType.getEleTy().isa<fir::LogicalType>())
-        decl = createDeclareReduction(firOpBuilder,
-                                      getReductionName(intrinsicOp, kindMap,
-                                                       firOpBuilder.getI1Type(),
-                                                       isByRef),
-                                      redId, redType, currentLocation, isByRef);
-      else
-        decl = createDeclareReduction(
-            firOpBuilder,
-            getReductionName(intrinsicOp, kindMap, redType, isByRef), redId,
-            redType, currentLocation, isByRef);
-      reductionDeclSymbols.push_back(mlir::SymbolRefAttr::get(
-          firOpBuilder.getContext(), decl.getSymName()));
-    }
-  } else if (const auto *reductionIntrinsic =
-                 std::get_if<omp::clause::ProcedureDesignator>(
-                     &redOperator.u)) {
-    if (ReductionProcessor::supportedIntrinsicProcReduction(
-            *reductionIntrinsic)) {
-      ReductionProcessor::ReductionIdentifier redId =
-          ReductionProcessor::getReductionType(*reductionIntrinsic);
-      for (const Object &object : objectList) {
-        const Fortran::semantics::Symbol *symbol = object.id();
-        mlir::Value symVal = converter.getSymbolAddress(*symbol);
-        if (auto declOp = symVal.getDefiningOp<hlfir::DeclareOp>())
-          symVal = declOp.getBase();
-        auto redType = symVal.getType().cast<fir::ReferenceType>();
-        if (!redType.getEleTy().isIntOrIndexOrFloat())
-          TODO(currentLocation, "User Defined Reduction on non-trivial type");
-        decl = createDeclareReduction(
-            firOpBuilder,
-            getReductionName(getRealName(*reductionIntrinsic).ToString(),
-                             firOpBuilder.getKindMap(), redType, isByRef),
-            redId, redType, currentLocation, isByRef);
-        reductionDeclSymbols.push_back(mlir::SymbolRefAttr::get(
-            firOpBuilder.getContext(), decl.getSymName()));
+    if (const auto &redDefinedOp =
+            std::get_if<omp::clause::DefinedOperator>(&redOperator.u)) {
+      const auto &intrinsicOp{
+          std::get<omp::clause::DefinedOperator::IntrinsicOperator>(
+              redDefinedOp->u)};
+      redId = getReductionType(intrinsicOp);
+      switch (redId) {
+      case ReductionIdentifier::ADD:
+      case ReductionIdentifier::MULTIPLY:
+      case ReductionIdentifier::AND:
+      case ReductionIdentifier::EQV:
+      case ReductionIdentifier::OR:
+      case ReductionIdentifier::NEQV:
+        break;
+      default:
+        TODO(currentLocation,
+             "Reduction of some intrinsic operators is not supported");
+        break;
       }
+
+      reductionName =
+          getReductionName(intrinsicOp, kindMap, redNameTy, isByRef);
+    } else if (const auto *reductionIntrinsic =
+                   std::get_if<omp::clause::ProcedureDesignator>(
+                       &redOperator.u)) {
+      if (!ReductionProcessor::supportedIntrinsicProcReduction(
+              *reductionIntrinsic)) {
+        TODO(currentLocation, "Unsupported intrinsic proc reduction");
+      }
+      redId = getReductionType(*reductionIntrinsic);
+      reductionName =
+          getReductionName(getRealName(*reductionIntrinsic).ToString(), kindMap,
+                           redNameTy, isByRef);
+    } else {
+      TODO(currentLocation, "Unexpected reduction type");
     }
+
+    decl = createDeclareReduction(converter, reductionName, redId, redType,
+                                  currentLocation, isByRef);
+    reductionDeclSymbols.push_back(
+        mlir::SymbolRefAttr::get(firOpBuilder.getContext(), decl.getSymName()));
   }
 }
 
-const Fortran::semantics::SourceName
-ReductionProcessor::getRealName(const Fortran::semantics::Symbol *symbol) {
+const semantics::SourceName
+ReductionProcessor::getRealName(const semantics::Symbol *symbol) {
   return symbol->GetUltimate().name();
 }
 
-const Fortran::semantics::SourceName
+const semantics::SourceName
 ReductionProcessor::getRealName(const omp::clause::ProcedureDesignator &pd) {
-  return getRealName(pd.v.id());
+  return getRealName(pd.v.sym());
 }
 
 int ReductionProcessor::getOperationIdentity(ReductionIdentifier redId,

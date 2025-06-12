@@ -27,9 +27,9 @@ define i64 @StoreLargeAccess1() #1 {
 ; COMMONCM-NEXT:                      stdx r5, r3, r4
 ; COMMONCM-NEXT:                      li r3, 55
 ; COMMONCM-NEXT:                      li r4, 64
-; COMMONCM-NEXT:                      std r3, (mySmallTLS2[TL]@le+696)-65536(r13)
+; COMMONCM-NEXT:                      std r3, mySmallTLS2[TL]@le+696-65536(r13)
 ; COMMONCM-NEXT:                      li r3, 142
-; COMMONCM-NEXT:                      std r4, (mySmallTLS3[TL]@le+20000)-131072(r13)
+; COMMONCM-NEXT:                      std r4, mySmallTLS3[TL]@le+20000-131072(r13)
 ; COMMONCM-NEXT:                      blr
 entry:
   %tls0 = tail call align 8 ptr @llvm.threadlocal.address.p0(ptr align 8 @mySmallTLS)
@@ -64,9 +64,9 @@ define i64 @StoreLargeAccess2() {
 ; CHECK-SMALLCM64-NEXT:    li r3, 55
 ; CHECK-SMALLCM64-NEXT:    li r4, 64
 ; CHECK-SMALLCM64-NEXT:    std r3, mySmallTLS2[TL]@le+696(r13)
+; CHECK-SMALLCM64-NEXT:    add r3, r13, r5
+; CHECK-SMALLCM64-NEXT:    std r4, 20000(r3)
 ; CHECK-SMALLCM64-NEXT:    li r3, 142
-; CHECK-SMALLCM64-NEXT:    add r5, r13, r5
-; CHECK-SMALLCM64-NEXT:    std r4, 20000(r5)
 ; CHECK-LARGECM64:         addis r3, L..C0@u(r2)
 ; CHECK-LARGECM64-NEXT:    li r4, 0
 ; CHECK-LARGECM64-NEXT:    li r5, 23
@@ -75,8 +75,8 @@ define i64 @StoreLargeAccess2() {
 ; CHECK-LARGECM64-NEXT:    add r3, r13, r3
 ; CHECK-LARGECM64-NEXT:    stdx r5, r3, r4
 ; CHECK-LARGECM64-NEXT:    addis r3, L..C1@u(r2)
-; CHECK-LARGECM64-NEXT:    li r4, 55
 ; CHECK-LARGECM64-NEXT:    li r5, 64
+; CHECK-LARGECM64-NEXT:    li r4, 55
 ; CHECK-LARGECM64-NEXT:    ld r3, L..C1@l(r3)
 ; CHECK-LARGECM64-NEXT:    std r4, mySmallTLS2[TL]@le+696(r13)
 ; CHECK-LARGECM64-NEXT:    add r3, r13, r3
