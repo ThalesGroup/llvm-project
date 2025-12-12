@@ -30,6 +30,7 @@ namespace llvm {
 class WebAssemblySubtarget;
 
 class WebAssemblyInstrInfo final : public WebAssemblyGenInstrInfo {
+  const WebAssemblySubtarget &Subtarget;
   const WebAssemblyRegisterInfo RI;
 
 public:
@@ -67,6 +68,8 @@ public:
 
   bool isExplicitTargetIndexDef(const MachineInstr &MI, int &Index,
                                 int64_t &Offset) const override;
+
+  bool expandPostRAPseudo(MachineInstr &MI) const override;
 };
 
 } // end namespace llvm
